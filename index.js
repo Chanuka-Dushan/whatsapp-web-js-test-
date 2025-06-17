@@ -1,51 +1,66 @@
-const fs = require('fs');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@adiwajshing/baileys');
+const { Boom } = require('@hapi/boom');
 const express = require('express');
-const qrcode = require('qrcode-terminal');
-const app = express();
-const port = 3000;
+const fs = require('fs');
 
-// Middleware
+const app = express();
 app.use(express.json());
 
-// Use LocalAuth to persist session
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox'],
-  },
+const authFile = './auth_info.json';
+const { state, saveState } = useSingleFileAuthState(authFile);
+
+async function startWhatsApp() {
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    printQRInTerminal: true,
+    auth: state
+  });
+
+  sock.ev.on('creds.update', saveState);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      console.log('Scan this QR code with WhatsApp:', qr);
+    }
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed due to', lastDisconnect.error, ', reconnecting:', shouldReconnect);
+      if (shouldReconnect) {
+        startWhatsApp();
+      }
+    }
+    if (connection === 'open') {
+      console.log('WhatsApp connection opened');
+    }
+  });
+
+  return sock;
+}
+
+startWhatsApp().then(sock => {
+  app.post('/send', async (req, res) => {
+    const { number, message } = req.body;
+    if (!number || !message) {
+      return res.status(400).json({ error: 'Missing number or message' });
+    }
+    const id = number.includes('@s.whatsapp.net') ? number : number + '@s.whatsapp.net';
+
+    try {
+      await sock.sendMessage(id, { text: message });
+      return res.json({ status: 'Message sent' });
+    } catch (err) {
+      console.error('Failed to send message:', err);
+      return res.status(500).json({ error: 'Failed to send message' });
+    }
+  });
+
+  const PORT = 3000;
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error('Failed to start WhatsApp socket:', err);
 });
-
-// Display QR if needed
-client.on('qr', (qr) => {
-  console.log('📲 Scan this QR code with WhatsApp:');
-  qrcode.generate(qr, { small: true });
-});
-
-// Ready event
-client.on('ready', () => {
-  console.log('✅ WhatsApp Web is ready to send messages!');
-});
-
-// Basic POST /send
-app.post('/send', async (req, res) => {
-  const { number, message } = req.body;
-  if (!number || !message) {
-    return res.status(400).json({ error: 'Missing number or message' });
-  }
-
-  const chatId = number.includes('@c.us') ? number : `${number}@c.us`;
-
-  try {
-    await client.sendMessage(chatId, message);
-    res.status(200).json({ status: 'Message sent' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed to send message' });
-  }
-});
-
-// Start
-client.initialize();
-app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
