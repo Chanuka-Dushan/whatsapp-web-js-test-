@@ -3,7 +3,11 @@ const {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  generateWAMessage,
+  makeCacheableSignalKeyStore,
 } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode-terminal');
 const express = require('express');
 const pino = require('pino');
 
@@ -11,29 +15,36 @@ const app = express();
 app.use(express.json());
 
 async function startSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: true, // ✅ QR will be shown in Termux terminal
     auth: state,
     logger: pino({ level: 'silent' }),
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+  // 🟩 Manually show QR in terminal
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, qr, lastDisconnect } = update;
+
+    if (qr) {
+      console.log("📷 Scan the QR below:");
+      qrcode.generate(qr, { small: true });
+    }
+
     if (connection === 'open') {
       console.log('✅ WhatsApp connected!');
     } else if (connection === 'close') {
-      const reason = lastDisconnect?.error?.output?.statusCode;
+      const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
+
       if (reason !== DisconnectReason.loggedOut) {
-        console.log('⚠️ Reconnecting...');
+        console.log('⚠️ Disconnected, reconnecting...');
         startSocket();
       } else {
-        console.log('❌ Logged out. Please re-scan QR.');
+        console.log('❌ Logged out. Please delete auth folder to reset.');
       }
     }
   });
@@ -44,18 +55,17 @@ async function startSocket() {
 startSocket().then((sock) => {
   app.post('/send', async (req, res) => {
     const { number, message } = req.body;
-
     if (!number || !message) {
       return res.status(400).json({ error: 'Missing number or message' });
     }
 
-    const id = number.includes('@s.whatsapp.net') ? number : number + '@s.whatsapp.net';
+    const jid = number.includes('@s.whatsapp.net') ? number : number + '@s.whatsapp.net';
 
     try {
-      await sock.sendMessage(id, { text: message });
+      await sock.sendMessage(jid, { text: message });
       res.json({ status: '✅ Message sent' });
     } catch (err) {
-      console.error('❌ Error sending message:', err);
+      console.error('❌ Send failed:', err);
       res.status(500).json({ error: 'Failed to send message' });
     }
   });
